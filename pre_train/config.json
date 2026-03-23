@@ -1,0 +1,17 @@
+{
+  "device": "cpu",
+  "epsilon_scalar_enc": 1.1,
+  "hidden_dim": 256,
+  "hidden_dim_scalar_enc": 32,
+  "kernel_size": 41,
+  "num_patches": 32,
+  "output_token": "cls_token",
+  "pre_training": false,
+  "return_transf_layer": -1,
+  "scalar_scales": null,
+  "transf_depth": 6,
+  "transf_dim_head": 32,
+  "transf_dropout": 0.1,
+  "transf_mlp_dim": 512,
+  "transf_num_heads": 8
+}

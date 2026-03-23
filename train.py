@@ -21,6 +21,7 @@ from transforms import (
     AddPixelLabels
 )
 from torch.utils import data
+from sklearn.metrics import f1_score
 import numpy as np
 from pathlib import Path
 import pandas as pd
@@ -49,11 +50,11 @@ def parse_args():
     parser.add_argument('--gpus', type=int, default=4,
                         help='Number of GPUs to use (0=CPU, 1=Single GPU, >=2=Multi-GPU DDP)')
     parser.add_argument(
-        "--num_workers", default=8, type=int, help="Number of workers"
+        "--num_workers", default=2, type=int, help="Number of workers"
     )
     parser.add_argument("--batch_size", type=int, default=500)
     parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    parser.add_argument('--num_pixels', default=50, type=int, help='Number of pixels to sample from the input sample')
+    parser.add_argument('--num_pixels', default=2, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int,
                         help='Number of time steps to sample from the input sample')
     # 数据路径与域
@@ -107,6 +108,19 @@ class TimeMatchToUSCropsAdapter:
         valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()  # [S, T]
         mask_flat = ~valid_flat  # [S, T] (True=Invalid)
         y_flat = pixel_labels.reshape(-1).long()  # [S]
+
+        if C > 1:
+            # 假设 Sentinel-2: Red=B4=index2, NIR=B8=index6
+            if C >= 7:
+                red = data_flat[:, :, 2:3]  # [S, T, 1]
+                nir = data_flat[:, :, 6:7]  # [S, T, 1]
+                denom = nir + red + 1e-8
+                ndvi = (nir - red) / denom
+                data_flat = ndvi  # [S, T, 1]
+            else:
+                # 如果不是标准 Sentinel-2，可取均值或报错
+                print("⚠️ Warning: Multi-channel input but not enough bands for NDVI. Using mean.")
+                data_flat = data_flat.mean(dim=-1, keepdim=True)  # [S, T, 1]
 
         # 2. 【关键修复】处理全无效时间步样本 (All Invalid Time Steps)
         # 现象：随机采样可能导致某像素所有时间步都被云遮挡 (valid_flat 全 False)
@@ -307,6 +321,7 @@ def train(args):
 
     # 创建适配器（用于训练循环）
     train_adapter = TimeMatchToUSCropsAdapter(device=args.device)
+    test_adapter = TimeMatchToUSCropsAdapter(device=args.device)
 
     for epoch in range(10):
         total_loss = 0.0
