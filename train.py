@@ -40,6 +40,8 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 import torch
 def parse_args():
     parser = argparse.ArgumentParser(description='Train an evaluate time series deep learning models.')
+    parser.add_argument('-e', '--epochs', type=int, default=50,
+                        help='number of training epochs')
     parser.add_argument('--device', default=None, type=str,
                         help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
     parser.add_argument('-n', '--per', default=0.3, type=float,
@@ -323,34 +325,32 @@ def train(args):
     train_adapter = TimeMatchToUSCropsAdapter(device=args.device)
     test_adapter = TimeMatchToUSCropsAdapter(device=args.device)
 
+    metrics_log = []  # 用于记录每轮指标
+
     for epoch in range(10):
+        # ===== 训练阶段 =====
+        network.train()
         total_loss = 0.0
         num_batches = 0
-        for batch_dict in tqdm(source_loader, desc=f"Epoch {epoch + 1}/10"):
-            # 转换 batch
+        for batch_dict in tqdm(source_loader, desc=f"Epoch {epoch + 1}/10 [Train]"):
             X_tuple, y_flat = train_adapter(batch_dict)
-            data_flat = X_tuple[0]  # [S, T, C]
+            data_flat = X_tuple[0]
 
-            # 转换为 Mantis 输入格式 (S, C, 512)
             S, T, C = data_flat.shape
-            x_mantis = data_flat.permute(0, 2, 1)  # [S, C, T]
+            x_mantis = data_flat.permute(0, 2, 1)
             if T != 512:
                 x_mantis = F.interpolate(x_mantis, size=512, mode='linear', align_corners=False)
 
-            # 过滤无效样本
             valid_mask = (y_flat != -100)
             if not valid_mask.any():
-                continue  # 跳过全无效 batch
+                continue
 
             x_mantis = x_mantis[valid_mask]
             y_valid = y_flat[valid_mask]
-
-            # 标签编码（必须在 GPU 上进行？不，先 CPU 编码再转 GPU）
             y_encoded = torch.from_numpy(le.transform(y_valid.cpu().numpy())).to(args.device)
 
-            # 前向传播
             optimizer.zero_grad()
-            logits = network(x_mantis)  # [S_valid, num_classes]
+            logits = network(x_mantis)
             loss = criterion(logits, y_encoded)
             loss.backward()
             optimizer.step()
@@ -358,15 +358,57 @@ def train(args):
             total_loss += loss.item()
             num_batches += 1
 
-        if num_batches > 0:
-            print(f"Epoch {epoch + 1}, Avg Loss: {total_loss / num_batches:.4f}")
-        else:
-            print("No valid samples in this epoch!")
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
 
-    # 5. 保存模型
-    save_path = f"./mantis_finetuned_{timestamp}_seed{args.seed}.pth"
-    torch.save(network.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
+        # ===== 测试评估阶段 =====
+        network.eval()
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for batch_dict in tqdm(test_loader, desc=f"Epoch {epoch + 1}/10 [Test]"):
+                X_tuple, y_flat = test_adapter(batch_dict)
+                data_flat = X_tuple[0]
+
+                S, T, C = data_flat.shape
+                x_mantis = data_flat.permute(0, 2, 1)
+                if T != 512:
+                    x_mantis = F.interpolate(x_mantis, size=512, mode='linear', align_corners=False)
+
+                valid_mask = (y_flat != -100)
+                if not valid_mask.any():
+                    continue
+
+                x_mantis = x_mantis[valid_mask]
+                y_valid = y_flat[valid_mask]
+
+                logits = network(x_mantis)
+                preds = torch.argmax(logits, dim=1).cpu().numpy()
+                true_labels = le.transform(y_valid.cpu().numpy())
+
+                all_preds.append(preds)
+                all_labels.append(true_labels)
+
+        if all_preds and all_labels:
+            all_preds = np.concatenate(all_preds)
+            all_labels = np.concatenate(all_labels)
+            macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        else:
+            macro_f1 = 0.0
+
+        print(f"Epoch {epoch + 1}, Train Loss: {avg_loss:.4f}, Test Macro F1: {macro_f1:.4f}")
+
+        # === 记录指标 ===
+        metrics_log.append({
+            'epoch': epoch + 1,
+            'train_loss': avg_loss,
+            'test_macro_f1': macro_f1
+        })
+
+    # === 循环结束后，保存为 CSV ===
+    csv_path = f"./results/{file_name}.csv"
+    pd.DataFrame(metrics_log).to_csv(csv_path, index=False)
+    print(f"✅ Metrics saved to {csv_path}")
 
 
 
