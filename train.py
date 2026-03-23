@@ -30,6 +30,9 @@ import random
 
 from datetime import datetime
 import os
+from mantis.architecture import MantisV2
+from sklearn.preprocessing import LabelEncoder
+import torch.nn as nn
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -77,6 +80,81 @@ def parse_args():
 # ==============================================
 
     return args
+
+class TimeMatchToUSCropsAdapter:
+    """
+    将 Batch Dict 转换为模型输入 (X, y)。
+    核心功能：处理全无效时间步样本，防止模型内除零错误 (NaN)。
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.warn_count = 0
+
+    def __call__(self, batch_dict):
+        pixels = batch_dict['pixels']  # [B, T, C, N]
+        positions = batch_dict['positions']  # [B, N] (DOY)
+        valid_pixels = batch_dict['valid_pixels']  # [B, N, T] (0/1)
+        pixel_labels = batch_dict['pixel_labels']  # [B, N]
+
+        B, T, C, N = pixels.shape
+
+        # 1. 展平维度: (B, N) -> Sample_Batch
+        data_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)  # [S, T, C]
+        doy_flat = positions.unsqueeze(1).expand(-1, N, -1).reshape(-1, T)  # [S, T]
+        valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()  # [S, T]
+        mask_flat = ~valid_flat  # [S, T] (True=Invalid)
+        y_flat = pixel_labels.reshape(-1).long()  # [S]
+
+        # 2. 【关键修复】处理全无效时间步样本 (All Invalid Time Steps)
+        # 现象：随机采样可能导致某像素所有时间步都被云遮挡 (valid_flat 全 False)
+        # 后果：STNet 计算权重和时分母为 0 -> NaN
+        # 策略：强制将第一个时间步标记为有效，并在 Loss 中忽略该样本
+        has_valid_time = valid_flat.any(dim=1)
+        all_invalid_mask = ~has_valid_time
+
+        if all_invalid_mask.any():
+            count = all_invalid_mask.sum().item()
+            if self.warn_count < 3:
+                print(f"⚠️ Fixing {count} all-invalid samples (forcing t=0 valid).")
+                self.warn_count += 1
+
+            # 强制修正 Mask
+            valid_flat[all_invalid_mask, 0] = True
+            mask_flat[all_invalid_mask, 0] = False
+            has_valid_time = valid_flat.any(dim=1)  # 更新状态
+
+        # 3. 处理数据中的 NaN/Inf (数值清洗)
+        # 将脏数据替换为 0，并将对应 Label 设为 Ignore (-100)
+        dirty_mask = torch.isnan(data_flat) | torch.isinf(data_flat)
+        if dirty_mask.any():
+            sample_dirty = dirty_mask.any(dim=(1, 2))
+            y_flat = y_flat.float()
+            y_flat[sample_dirty] = -100.0
+            y_flat = y_flat.long()
+            data_flat[dirty_mask] = 0.0
+
+            if self.warn_count < 3:
+                print(f"⚠️ Cleaned {sample_dirty.sum()} samples with NaN/Inf values.")
+                self.warn_count += 1
+
+        # 4. 应用 Label Ignore
+        # 如果样本依然没有有效时间步 (理论上已被步骤 2 修复，此处为双重保险)，设为 -100
+        IGNORE_INDEX = -100
+        y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
+
+        # 5. 最终安全检查
+        data_flat = torch.nan_to_num(data_flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 构建输入元组
+        X_tuple = (data_flat, mask_flat, doy_flat, valid_flat.float())
+
+        # 6. 移至设备
+        if self.device:
+            X_tuple = tuple(t.to(self.device) if torch.is_tensor(t) else t for t in X_tuple)
+            y_flat = y_flat.to(self.device)
+
+        return X_tuple, y_flat
 
 def get_data_loaders(splits, config, balance_source=True):
 
