@@ -39,6 +39,8 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 import torch
 def parse_args():
     parser = argparse.ArgumentParser(description='Train an evaluate time series deep learning models.')
+    parser.add_argument('--device', default=None, type=str,
+                        help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
     parser.add_argument('-n', '--per', default=0.3, type=float,
                         help='percentage of labeled samples (training and validation) (default )')
     parser.add_argument('--seed', default=111, type=int,
@@ -55,10 +57,10 @@ def parse_args():
     parser.add_argument('--seq_length', default=30, type=int,
                         help='Number of time steps to sample from the input sample')
     # 数据路径与域
-    parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
-                        help='Path to datasets root directory')
-    # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
+    # parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
     #                     help='Path to datasets root directory')
+    parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
+                        help='Path to datasets root directory')
     parser.add_argument('--source', default='france/31TCJ/2017', type=str)
     # parser.add_argument('--target', default='france/31TCJ/2017', type=str) denmark/32VNH/2017 austria/33UVP/2017 france/30TXT/2017
     # 类别处理
@@ -281,7 +283,7 @@ def train(args):
     # 2. 加载预训练 Mantis 模型
     print("=> Loading pre-trained MantisV2 model...")
     network = MantisV2(device=args.device)
-    network = network.from_pretrained("paris-noah/MantisV2")
+    network = network.from_pretrained("/mnt/d/All_Documents/documents/ViT/dataset/mantis")
     network.train()
 
     # 3. 收集所有唯一标签以构建编码器（只需一次）
