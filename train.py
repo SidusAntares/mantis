@@ -39,7 +39,7 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 import torch
 def parse_args():
     parser = argparse.ArgumentParser(description='Train an evaluate time series deep learning models.')
-    parser.add_argument('-n', '--per', default=0.3, type=int,
+    parser.add_argument('-n', '--per', default=0.3, type=float,
                         help='percentage of labeled samples (training and validation) (default )')
     parser.add_argument('--seed', default=111, type=int,
                         help='seed')
@@ -238,7 +238,7 @@ def train(args):
 
     # 控制微调样本量
     total_num = len(source_data)  # 获取全量长度
-    if args.useall or args.per ==1 :
+    if  args.per ==1 :
         use_num = total_num
         print(f"Using all {total_num} samples.")
     elif args.per>1 or args.per <0:
@@ -278,7 +278,78 @@ def train(args):
 
     file_name = f'{source_name}/finetune_R{use_num}_{timestamp}_Seed{args.seed}'
 
+    # 2. 加载预训练 Mantis 模型
+    print("=> Loading pre-trained MantisV2 model...")
+    network = MantisV2(device=args.device)
+    network = network.from_pretrained("paris-noah/MantisV2")
+    network.train()
 
+    # 3. 收集所有唯一标签以构建编码器（只需一次）
+    print("=> Building label encoder...")
+    all_labels = []
+    adapter_for_labels = TimeMatchToUSCropsAdapter(device='cpu')
+    for batch_dict in tqdm(source_loader, desc="Scanning labels"):
+        _, y_flat = adapter_for_labels(batch_dict)
+        valid_y = y_flat[y_flat != -100].cpu().numpy()
+        all_labels.append(valid_y)
+    all_labels = np.concatenate(all_labels)
+    le = LabelEncoder()
+    le.fit(all_labels)
+    num_classes = len(le.classes_)
+    print(f"Number of classes: {num_classes}")
+
+    # 4. 微调 Mantis（直接在 source_loader 上训练，不创建新 DataLoader）
+    print("=> Starting fine-tuning of Mantis...")
+    optimizer = torch.optim.AdamW(network.parameters(), lr=1e-4, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    # 创建适配器（用于训练循环）
+    train_adapter = TimeMatchToUSCropsAdapter(device=args.device)
+
+    for epoch in range(10):
+        total_loss = 0.0
+        num_batches = 0
+        for batch_dict in tqdm(source_loader, desc=f"Epoch {epoch + 1}/10"):
+            # 转换 batch
+            X_tuple, y_flat = train_adapter(batch_dict)
+            data_flat = X_tuple[0]  # [S, T, C]
+
+            # 转换为 Mantis 输入格式 (S, C, 512)
+            S, T, C = data_flat.shape
+            x_mantis = data_flat.permute(0, 2, 1)  # [S, C, T]
+            if T != 512:
+                x_mantis = F.interpolate(x_mantis, size=512, mode='linear', align_corners=False)
+
+            # 过滤无效样本
+            valid_mask = (y_flat != -100)
+            if not valid_mask.any():
+                continue  # 跳过全无效 batch
+
+            x_mantis = x_mantis[valid_mask]
+            y_valid = y_flat[valid_mask]
+
+            # 标签编码（必须在 GPU 上进行？不，先 CPU 编码再转 GPU）
+            y_encoded = torch.from_numpy(le.transform(y_valid.cpu().numpy())).to(args.device)
+
+            # 前向传播
+            optimizer.zero_grad()
+            logits = network(x_mantis)  # [S_valid, num_classes]
+            loss = criterion(logits, y_encoded)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+        if num_batches > 0:
+            print(f"Epoch {epoch + 1}, Avg Loss: {total_loss / num_batches:.4f}")
+        else:
+            print("No valid samples in this epoch!")
+
+    # 5. 保存模型
+    save_path = f"./mantis_finetuned_{timestamp}_seed{args.seed}.pth"
+    torch.save(network.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
 
 
 
