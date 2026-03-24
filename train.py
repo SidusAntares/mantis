@@ -142,8 +142,8 @@ def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1,
         folds.append(splits)
     return folds
 
-def resize(X):
-    X_scaled = F.interpolate(torch.tensor(X, dtype=torch.float), size=512, mode='linear', align_corners=False)
+def resize(X, size):
+    X_scaled = F.interpolate(torch.tensor(X, dtype=torch.float), size=size, mode='linear', align_corners=False)
     return X_scaled.numpy()
 
 def shape_adjust(batch_dict):
@@ -156,7 +156,7 @@ def shape_adjust(batch_dict):
     x = pixels.permute(3, 0, 2, 1).reshape(-1, C, T)
     y = pixel_labels.reshape(-1)
     if C != 512:
-        x = resize(x) # (n_samples, n_channels=1, seq_len)
+        x = resize(x, 32) # (n_samples, n_channels=1, seq_len)
 
     return x, y
 
@@ -287,7 +287,7 @@ def train(args):
             case 'denmark/32VNH/2017': source_name = 'DK1'
             case _: source_name = 'AT1'
 
-        file_name = f'./results/{source_name}_mantisv2_finetune_R{len(x_train)}_{timestamp}_Seed{args.seed}.csv'
+        file_name = f'./results/{source_name}/{args.model}_{args.fine_tuning_type}_{len(x_train)}_{timestamp}_Seed{args.seed}.csv'
         Path(file_name).parent.mkdir(parents=True, exist_ok=True)
 
         results_df = pd.DataFrame({
