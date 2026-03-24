@@ -114,9 +114,8 @@ class Normalize(object):
 
 class ToTensor(object):
     def __call__(self, sample):
-        sample['pixels'] = torch.from_numpy(sample['pixels'].astype(np.float32))
         sample['valid_pixels'] = torch.from_numpy(sample['valid_pixels'].astype(np.float32))
-        sample['positions'] = torch.from_numpy(sample['positions'].astype(np.long))
+        sample['positions'] = torch.from_numpy(sample['positions'].astype(np.int64))
         if 'extra' in sample:
             sample['extra'] = torch.from_numpy(sample['extra'].astype(np.float32))
         if isinstance(sample['label'], int):
