@@ -211,8 +211,7 @@ def train(args):
     # Collect all training data
     all_x_train = []
     all_y_train = []
-    # for batch_dict in tqdm(source_loader, desc="Loading Training Data"):
-    for batch_dict in source_loader:
+    for batch_dict in tqdm(source_loader, desc="Loading Training Data"):
         x, y = shape_adjust(batch_dict)
         all_x_train.append(x), all_y_train.append(y)
 
@@ -228,10 +227,9 @@ def train(args):
     print(f"Expected input channels: {x_train.shape[1]}")  # Should be 10
 
     # --- 3. Prepare Test Data (SAME AS TRAINING) ---
-    print("=> Preparing test data...")
     all_x_test = []
     all_y_test = []
-    for batch_dict in test_loader:
+    for batch_dict in tqdm(test_loader, desc="Preparing test data"):
         x, y = shape_adjust(batch_dict)
         all_x_test.append(x), all_y_test.append(y)
 
