@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from mantis.architecture import MantisV2
 from mantis.trainer import MantisTrainer
 from mantis.adapters import MultichannelProjector
-
+from scipy.interpolate import interp1d
 # --- Global Variables ---
 timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -44,7 +44,7 @@ def parse_args():
     """Parses command line arguments."""
     parser = argparse.ArgumentParser(description='Fine-tune MantisV2 on Timematch dataset.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--device', default=None, type=str, help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
+    parser.add_argument('--device', default='cuda:0', type=str, help='Device to use (e.g., cuda:0, cpu). Auto-detected if not specified.')
     parser.add_argument('--per', default=0.3, type=float, help='Percentage of labeled samples to use for training/validation.')
     parser.add_argument('--seed', default=111, type=int, help='Random seed for reproducibility.')
     parser.add_argument('--num_workers', default=2, type=int, help='Number of workers for data loading.')
@@ -59,10 +59,11 @@ def parse_args():
     parser.add_argument("--val_ratio", default=0.1, type=float, help='Validation ratio.')
     parser.add_argument("--test_ratio", default=0.2, type=float, help='Test ratio.')
     parser.add_argument('--sample_pixels_val', action='store_true', help='Sample pixels during validation.')
-
+    parser.add_argument('--doy_p', action='store_true',help='doy project')
     # mantis
-    parser.add_argument('--model',default = 'MultichannelProjector')
-    parser.add_argument('--fine_tuning_type',default = 'head')
+    parser.add_argument('--model', default = 'MultichannelProjector', type = str)
+    parser.add_argument('--fine_tuning_type', default = 'head', type = str)
+    parser.add_argument('--seq_len', default = '32', type = int)
 
     args = parser.parse_args()
     if args.device is None:
@@ -146,7 +147,88 @@ def resize(X, size):
     X_scaled = F.interpolate(torch.tensor(X, dtype=torch.float), size=size, mode='linear', align_corners=False)
     return X_scaled.numpy()
 
-def shape_adjust(batch_dict):
+
+def interpolate_sparse_data(X_tensor, target_length=352):
+    """
+    对一个稀疏（大部分为零，少数位置有数据）的张量进行线性插值填充。
+
+    Args:
+        X_tensor (torch.Tensor): 输入稀疏张量, 形状为 (..., target_length)。
+                                 例如 (N, C, 352)。
+        target_length (int): 时间轴的长度，默认为 352。
+
+    Returns:
+        torch.Tensor: 插值后的张量，形状与输入相同。
+    """
+    device = X_tensor.device
+    X_np = X_tensor.cpu().numpy()
+
+    # 获取除了时间维度外的其他维度 (e.g., (N, C))
+    other_shape = X_np.shape[:-1]
+    num_series = int(np.prod(other_shape))  # 计算需要插值的总序列数
+
+    # 将数据重塑为二维 (num_series, time_steps)，方便批量处理
+    X_2d = X_np.reshape(num_series, target_length)
+
+    # 创建全局时间轴
+    global_time_axis = np.arange(target_length)  # [0, 1, ..., 351]
+
+    # 初始化输出数组
+    result_2d = np.empty_like(X_2d)
+
+    # --- 核心插值循环 ---
+    # 对每一个时间序列进行插值
+    for i in range(num_series):
+        ts = X_2d[i]
+
+        # 找到非零点（即真实数据点）
+        # 注意：如果用 0 填充，就检查非零；如果用 np.nan 填充，就检查 !np.isnan
+        non_zero_indices = np.nonzero(ts)[0]
+
+        if len(non_zero_indices) < 2:
+            # 如果有效数据点少于2个，无法插值，保持原样
+            # 或者可以在这里填充为一个常数，取决于你的需求
+            result_2d[i] = ts
+        else:
+            # 获取有效数据点的值
+            non_zero_values = ts[non_zero_indices]
+
+            # 创建插值函数
+            # kind='linear' 表示线性插值
+            # bounds_error=False, fill_value='extrapolate' 表示允许外推
+            interpolator = interp1d(
+                non_zero_indices,
+                non_zero_values,
+                kind='linear',
+                bounds_error=False,
+                fill_value='extrapolate'
+            )
+
+            # 在全局时间轴上进行插值
+            # 这会计算出 0 到 351 每个位置的插值结果
+            interpolated_values = interpolator(global_time_axis)
+
+            # 将插值结果存回输出数组
+            result_2d[i] = interpolated_values
+
+    # 将结果重塑回原始形状
+    interpolated_X = result_2d.reshape(other_shape + (target_length,))
+
+    # 转换回 PyTorch 张量，并保持原始的 device
+    return torch.from_numpy(interpolated_X).to(device)
+
+def doy_project(x, doy, seq_len=352):
+    B, T = doy.shape
+    doy = doy - 15
+    mask = doy < 0
+    doy[mask] = 0
+    N, C, T = x.shape
+    doy = doy.unsqueeze(1).expand(B, N//B, C, T).reshape(N, C, T)
+    x_padded = torch.zeros((N, C, seq_len), dtype=x.dtype, device=x.device)
+    x_padded.scatter_(2, doy, x)
+    return x_padded
+
+def shape_adjust(batch_dict, doy_p=False, seq_len=32):
     # Extract pixels and labels directly
     pixels = batch_dict['pixels']  # [B, T, C, N]
     pixel_labels = batch_dict['pixel_labels']  # [B, N]
@@ -155,8 +237,12 @@ def shape_adjust(batch_dict):
     # Reshape to (B*N, T, C) -> (S, C, T)
     x = pixels.permute(3, 0, 2, 1).reshape(-1, C, T)
     y = pixel_labels.reshape(-1)
-    if C != 512:
-        x = resize(x, 32) # (n_samples, n_channels=1, seq_len)
+    if doy_p:
+        seq_len = 352
+        x = doy_project(x, batch_dict['positions'], seq_len)
+        x = interpolate_sparse_data(x, seq_len)
+    elif C != seq_len:
+        x = resize(x, seq_len) # (n_samples, n_channels=1, seq_len)
 
     return x, y
 
@@ -212,7 +298,7 @@ def train(args):
     all_x_train = []
     all_y_train = []
     for batch_dict in tqdm(source_loader, desc="Loading Training Data"):
-        x, y = shape_adjust(batch_dict)
+        x, y = shape_adjust(batch_dict, args.doy_p, args.seq_len)
         all_x_train.append(x), all_y_train.append(y)
 
     # Concatenate all batches
@@ -230,7 +316,7 @@ def train(args):
     all_x_test = []
     all_y_test = []
     for batch_dict in tqdm(test_loader, desc="Preparing test data"):
-        x, y = shape_adjust(batch_dict)
+        x, y = shape_adjust(batch_dict, args.doy_p, args.seq_len)
         all_x_test.append(x), all_y_test.append(y)
 
     x_test = np.concatenate(all_x_test, axis=0)
@@ -245,7 +331,7 @@ def train(args):
     # Define optimizer for fine-tuning
     def init_optimizer(params):
         return torch.optim.AdamW(params, lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
-
+    adapter = None
     if args.model == 'MultichannelProjector':
         adapter = MultichannelProjector(new_num_channels=5, patch_window_size=1, base_projector='pca')
         adapter.fit(x_train)
@@ -261,6 +347,7 @@ def train(args):
         x_train,
         y_train,
         num_epochs=args.epochs,
+        adapter=adapter,
         batch_size=args.batch_size,
         fine_tuning_type=args.fine_tuning_type,
         init_optimizer=init_optimizer,
